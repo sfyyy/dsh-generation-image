@@ -31,12 +31,12 @@
   "author": "sfyyy",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/sfyyy/dsh-gengration-image.git"
+    "url": "git+https://github.com/sfyyy/dsh-generation-image.git"
   },
   "bugs": {
-    "url": "https://github.com/sfyyy/dsh-gengration-image/issues"
+    "url": "https://github.com/sfyyy/dsh-generation-image/issues"
   },
-  "homepage": "https://github.com/sfyyy/dsh-gengration-image#readme",
+  "homepage": "https://github.com/sfyyy/dsh-generation-image#readme",
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/"
