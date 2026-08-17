@@ -1,0 +1,3 @@
+- insert:
+    - id: generation-image
+      name: '@dsh-extension/dsh-generation-image'
