@@ -274,6 +274,52 @@ test('AC3: execute parses a plain JSON (non-streaming) response', async () => {
   assert.equal(value.images[0].mediaType, 'image/png')
 })
 
+test('AC3b: size/quality are unrestricted — auto/empty is omitted, custom values pass through', async () => {
+  const b64 = base64Of(PNG)
+  const seen = []
+  const ctx = createFakeCtx({ ...CONFIG, size: '', quality: 'auto' })
+  await apply(ctx, {
+    fetch: async (url, init) => {
+      seen.push({ url, init })
+      return new Response(
+        JSON.stringify({ data: [{ b64_json: b64 }] }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      )
+    },
+  })
+
+  const tool = ctx._tools.registered.find((d) => d.name === 'generate_image')
+
+  // default: no size in config, model passes nothing → 'auto' → fields omitted
+  const autoValue = await tool.execute(
+    { prompt: 'test' },
+    { agent: { session: fakeSession([]) } },
+  )
+  let request = JSON.parse(seen[0].init.body)
+  assert.equal(request.size, undefined)
+  assert.equal(request.quality, undefined)
+  assert.equal(autoValue.size, 'auto')
+  assert.equal(autoValue.quality, 'auto')
+
+  // explicit 'auto' arguments → omitted too
+  await tool.execute(
+    { prompt: 'test', size: 'auto', quality: 'auto' },
+    { agent: { session: fakeSession([]) } },
+  )
+  request = JSON.parse(seen[1].init.body)
+  assert.equal(request.size, undefined)
+  assert.equal(request.quality, undefined)
+
+  // custom/unrestricted values (any string) pass through verbatim
+  await tool.execute(
+    { prompt: 'test', size: '2048x2048', quality: 'hd' },
+    { agent: { session: fakeSession([]) } },
+  )
+  request = JSON.parse(seen[2].init.body)
+  assert.equal(request.size, '2048x2048')
+  assert.equal(request.quality, 'hd')
+})
+
 test('AC4: nested (run_code) dispatch defers the image back into context', async () => {
   const b64 = base64Of(PNG)
   const ctx = createFakeCtx(CONFIG)

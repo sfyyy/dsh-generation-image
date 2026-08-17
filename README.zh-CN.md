@@ -104,26 +104,29 @@ dsh plugin inject /path/to/dsh-generation-image
 ## 配置
 
 在 **Settings → Generation Image**（DSH Web）中配置，或编辑
-`~/.dsh/generation-image.json`：
+`~/.dsh/generation-image.json`。**插件默认不带任何 key/url（均为空）**——
+端点 URL 和 API Key 由你自己填（Settings 页、环境变量或配置文件均可）：
 
 ```json
 {
   "enabled": true,
-  "baseUrl": "https://api.xiaoyaoapi.cc/v1",
+  "baseUrl": "https://your-image-endpoint.example/v1",
   "apiKey": "sk-xxxx",
   "model": "gpt-image-2",
-  "size": "1024x1024",
+  "size": "",
   "quality": "auto"
 }
 ```
 
-- `baseUrl` — OpenAI 兼容图像 API 根地址（`.../v1`）；插件会规范化并调用
-  `${baseUrl}/images/generations`。
-- `apiKey` 与 `apiKeyEnv` 互斥。直接填写的 key 会同步到 DSH 凭据库，并以
-  `DSH_GENERATION_IMAGE_API_KEY` 引用。
+- `baseUrl` — OpenAI 兼容图像 API 根地址（`.../v1`）；**默认为空**，插件会规范
+  化并调用 `${baseUrl}/images/generations`。
+- `apiKey` / `apiKeyEnv` — **默认为空**，二者互斥。直接填写的 key 会同步到
+  DSH 凭据库，并以 `DSH_GENERATION_IMAGE_API_KEY` 引用。
 - `model` — 图像模型 id（默认 `gpt-image-2`）。
-- `size` — 默认图片尺寸（默认 `1024x1024`；工具可按次覆盖）。
-- `quality` — 默认质量：`auto`（默认）、`low`、`medium`、`high`。
+- `size` — 默认尺寸提示，**默认为空 = 不限制**：模型每次调用可传任意尺寸，
+  或传 `"auto"` 让 API 自己决定；不会强制任何尺寸。
+- `quality` — 默认质量提示：`auto`（默认，请求中省略该字段，由 API 决定），
+  或模型/端点接受的任意值。
 - `enabled: false` 会禁用整条链路：不注册工具、不做图片改写、不启用放行补丁
   （恢复原生行为）。
 
@@ -138,9 +141,10 @@ dsh plugin inject /path/to/dsh-generation-image
 
 - **参数**
   - `prompt`（必填）：对要生成图片的详细描述；
-  - `size`（可选）：如 `1024x1024`、`1024x1792`、`1792x1024`（默认取配置的
-    `size`）；
-  - `quality`（可选）：`auto` | `low` | `medium` | `high`；
+  - `size`（可选，**不限制**）：可传端点接受的任意尺寸（如 `1024x1024`、
+    `1024x1792`、`1792x1024`），或 `"auto"`/省略让 API 决定；
+  - `quality`（可选，**不限制**）：常见值 `auto`（默认）、`low`、`medium`、
+    `high`，或端点接受的任意值；
   - `count`（可选，1–4）：生成几张图片（默认 1）。
 - **行为**：调用配置的图像端点 → 解析 SSE 流（或普通 JSON）→ 用 magic
   bytes 识别真实格式 → 通过 DSH attachment 服务持久化每张图 → 返回文字摘要

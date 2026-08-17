@@ -27,23 +27,24 @@
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
 | `enabled` | bool | `true` | master switch |
-| `baseUrl` | string | `''` | OpenAI-compatible API root; normalized to `.../v1` |
-| `apiKey` | string | `''` | direct key; synced to credential `DSH_GENERATION_IMAGE_API_KEY` |
+| `baseUrl` | string | `''` | **empty by default** (user-supplied); normalized to `.../v1` |
+| `apiKey` | string | `''` | **empty by default**; direct key synced to credential `DSH_GENERATION_IMAGE_API_KEY` |
 | `apiKeyEnv` | string | `''` | env-var name holding the key (mutually exclusive with apiKey) |
 | `model` | string | `gpt-image-2` | image model id |
-| `size` | string | `1024x1024` | default size |
-| `quality` | string | `auto` | `auto\|low\|medium\|high` |
+| `size` | string | `''` | **unrestricted**: empty/`auto` = omit from request (API decides); any concrete value passes through |
+| `quality` | string | `auto` | **unrestricted**: `auto`/empty = omit from request; any value passes through |
 
 Precedence (highest wins): Settings page → env vars → config file.
 Env prefix: `DSH_GENERATION_IMAGE_` + `UPPER_SNAKE(key)`.
 
 ### Tool `generate_image`
 
-- args: `prompt` (required string), `size` (optional), `quality` (optional enum),
-  `count` (optional int 1–4, default 1).
+- args: `prompt` (required string), `size` (optional string, unrestricted),
+  `quality` (optional string, unrestricted), `count` (optional int 1–4, default 1).
 - Request body to `${baseUrl}/images/generations`:
-  `{ model, prompt, response_format: 'b64_json', n, size, quality(≠auto), stream: true, partial_images: 1 }`,
-  header `Authorization: Bearer <key>`.
+  `{ model, prompt, response_format: 'b64_json', n, size?, quality?, stream: true, partial_images: 1 }`,
+  header `Authorization: Bearer <key>`. `size`/`quality` are sent only when a
+  non-empty, non-`auto` value is supplied (case-insensitive `auto` check).
 - Response: SSE (`image_generation.completed` / `partial_image` events carrying
   `b64_json`) or plain JSON (`data[].b64_json`).
 - Output value: `{ prompt, size, quality, count, images: [{ attachmentId, mediaType, bytes, width, height, name }] }`.

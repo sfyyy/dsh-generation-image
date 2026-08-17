@@ -114,27 +114,32 @@ dsh plugin inject /path/to/dsh-generation-image
 ## Configuration
 
 Configure it in **Settings → Generation Image** (DSH Web), or edit
-`~/.dsh/generation-image.json`:
+`~/.dsh/generation-image.json`. **The plugin ships with empty credentials by
+default** — you supply your own endpoint URL + API key (via the Settings page,
+env vars, or the config file):
 
 ```json
 {
   "enabled": true,
-  "baseUrl": "https://api.xiaoyaoapi.cc/v1",
+  "baseUrl": "https://your-image-endpoint.example/v1",
   "apiKey": "sk-xxxx",
   "model": "gpt-image-2",
-  "size": "1024x1024",
+  "size": "",
   "quality": "auto"
 }
 ```
 
-- `baseUrl` — OpenAI-compatible image API root (`.../v1`); the plugin
-  normalizes it and calls `${baseUrl}/images/generations`.
-- `apiKey` and `apiKeyEnv` are mutually exclusive. A directly entered key is
-  synced to the DSH credential store and referenced as
+- `baseUrl` — OpenAI-compatible image API root (`.../v1`); **empty by default**,
+  the plugin normalizes it and calls `${baseUrl}/images/generations`.
+- `apiKey` / `apiKeyEnv` — **empty by default**, mutually exclusive. A directly
+  entered key is synced to the DSH credential store and referenced as
   `DSH_GENERATION_IMAGE_API_KEY`.
 - `model` — the image model id (default `gpt-image-2`).
-- `size` — default image size (default `1024x1024`; the tool can override per call).
-- `quality` — default image quality: `auto` (default), `low`, `medium`, `high`.
+- `size` — default size hint, **empty by default = unrestricted**: the model
+  passes any size per call, or `"auto"` to let the API decide. No value is
+  hardcoded or restricted.
+- `quality` — default quality hint: `auto` (default; omitted from the request,
+  the API decides) or any value the model/endpoint accepts.
 - `enabled: false` disables the whole chain: no tool registration, no image
   rewriting, no admission bypass (native behavior restored).
 
@@ -150,9 +155,11 @@ environment variables → config file.
 
 - **Arguments**
   - `prompt` (required): a detailed description of the image to generate;
-  - `size` (optional): e.g. `1024x1024`, `1024x1792`, `1792x1024` (defaults to
-    the configured `size`);
-  - `quality` (optional): `auto` | `low` | `medium` | `high`;
+  - `size` (optional, **unrestricted**): pass any size the endpoint accepts
+    (e.g. `1024x1024`, `1024x1792`, `1792x1024`), or `"auto"`/omit to let the
+    API decide;
+  - `quality` (optional, **unrestricted**): common values are `auto` (default),
+    `low`, `medium`, `high`, or any value your endpoint accepts;
   - `count` (optional, 1–4): how many images to generate (default 1).
 - **Behavior**: calls the configured image endpoint → parses the SSE stream
   (or plain JSON) → sniffs the real media type from magic bytes → durably saves
