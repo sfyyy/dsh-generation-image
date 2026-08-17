@@ -48,8 +48,16 @@ Env prefix: `DSH_GENERATION_IMAGE_` + `UPPER_SNAKE(key)`.
   `b64_json`) or plain JSON (`data[].b64_json`).
 - Output value: `{ prompt, size, quality, count, images: [{ attachmentId, mediaType, bytes, width, height, name }] }`.
 - `output.render` → `[ {type:'text',...}, ...images.map(ref => ({ type:'image', attachment: ref })) ]`.
-- Nested dispatch (`exec.parent !== undefined`) must
-  `exec.deferContext(createUserMessage({ content, source: { kind:'plugin', plugin:'generation-image' } }))`.
+- **UI visibility**: bare `tool-result` image blocks are NOT rendered as
+  thumbnails by the DSH web UI (only user-bubble and assistant-markdown image
+  blocks are). So the tool ALWAYS defers a user-role context message with the
+  rendered content:
+  `exec.deferContext(createUserMessage({ content, source: { kind: 'plugin', plugin: 'generation-image' } }))`.
+- **Download in the enlarged view**: the built-in `ImageLightbox` has no
+  download button. The client (`lib/client.js`, `installLightboxDownload`)
+  injects a `下载原图` button into every opened lightbox (`[role="dialog"][aria-modal="true"]`
+  containing an `<img>`); the enlarged `<img src>` is a same-origin blob:/data:
+  URL, so an `<a download>` click downloads it directly.
 
 ## 4. Validation & Error Matrix
 

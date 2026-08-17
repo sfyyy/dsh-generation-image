@@ -16,7 +16,8 @@
 - **自带图像端点** — 任何 OpenAI 兼容的 `/images/generations` 服务（OpenAI、
   xiaoyaoapi、vLLM 图像模型、本地网关……）。
 - **图片进入会话界面** — 生成的字节会通过 DSH attachment 服务持久化保存，
-  并以 image 块呈现在会话日志与 Web 界面里。
+  并以用户消息的形式放进会话，渲染成可点击的**缩略图**。点击可**放大**，
+  放大后可**下载或关闭**。
 - **文本模型保持安全** — DeepSeek 是纯文本模型，因此每次文本模型请求都会把
   image 块改写成文字标记（与
   [dsh-vision-bridge](https://github.com/sfyyy/dsh-vision-bridge) 相同的机制）；
@@ -43,12 +44,27 @@ SSE（image_generation.partial_image / .completed → b64_json）
 magic bytes 识别格式 → attachments.saveImage() → 持久化图片引用
    │
    ▼
-工具结果：文字摘要 + image 块  → 会话日志与界面显示图片
+工具结果：文字摘要 + image 块，并追加一条用户角色图片消息
+→ 会话中渲染为可点击缩略图
+   │
+   ▼
+点击缩略图 → 内置灯箱放大，含「下载原图」+「关闭」
    │
    ▼
 deriveMessages() 把 image 块改写为文字标记（文本模型永不收到 image 块）；
 llm.resolveModelInfo 放行补丁让消息能进入 agent。
 ```
+
+## 查看生成的图片
+
+DSH Web 会把每张生成的图片渲染成会话里的**缩略图**（用户角色图片消息）。
+点击缩略图即可打开放大的灯箱：
+
+- **下载原图** — 本插件客户端在放大视图右上角注入的下载按钮，把高清原图保存
+  到本地。它作用于会话里的所有图片灯箱，因此上传的图片和截图同样具备下载能力。
+- **关闭** — 内置关闭按钮（以及 `Esc` / 点击遮罩）。
+
+无需额外配置；只要客户端 bundle 加载（升级插件后刷新一次 DSH 页面）即生效。
 
 ## 安装
 

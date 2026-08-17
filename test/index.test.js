@@ -193,6 +193,7 @@ test('AC2: execute calls /images/generations (SSE), saves an attachment, renders
   const b64 = base64Of(PNG)
   const ctx = createFakeCtx(CONFIG)
   const session = fakeSession([])
+  const deferred = []
   const seen = []
   await apply(ctx, {
     fetch: async (url, init) => {
@@ -210,13 +211,28 @@ test('AC2: execute calls /images/generations (SSE), saves an attachment, renders
   const tool = ctx._tools.registered.find((d) => d.name === 'generate_image')
   const value = await tool.execute(
     { prompt: 'a cat in a hat', size: '1024x1024', quality: 'high' },
-    { agent: { session }, signal: new AbortController().signal },
+    {
+      agent: { session },
+      signal: new AbortController().signal,
+      deferContext(context) {
+        deferred.push(context)
+      },
+    },
   )
 
   assert.equal(value.images.length, 1)
   assert.equal(value.images[0].mediaType, 'image/png')
   assert.equal(value.images[0].bytes, PNG.length)
   assert.equal(value.count, 1)
+
+  // The generated image must be deferred as a user-role context message so the
+  // conversation UI renders a thumbnail (bare tool-result images are not
+  // rendered by the DSH web UI).
+  assert.equal(deferred.length, 1, 'root calls must defer the image into context')
+  assert.equal(deferred[0].content[0].type, 'text')
+  assert.equal(deferred[0].content[1].type, 'image')
+  assert.equal(deferred[0].content[1].attachment.attachmentId, value.images[0].attachmentId)
+  assert.equal(deferred[0].source.plugin, 'generation-image')
 
   assert.equal(seen.length, 1)
   assert.match(seen[0].url, /\/images\/generations$/)
