@@ -7,6 +7,7 @@
   "types": "./lib/types/index.d.ts",
   "files": [
     "lib",
+    "skills",
     "cordis.patch.yml"
   ],
   "keywords": [
@@ -30,12 +31,12 @@
   "author": "sfyyy",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/sfyyy/dsh-generation-image.git"
+    "url": "git+https://github.com/sfyyy/dsh-gengration-image.git"
   },
   "bugs": {
-    "url": "https://github.com/sfyyy/dsh-generation-image/issues"
+    "url": "https://github.com/sfyyy/dsh-gengration-image/issues"
   },
-  "homepage": "https://github.com/sfyyy/dsh-generation-image#readme",
+  "homepage": "https://github.com/sfyyy/dsh-gengration-image#readme",
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/"

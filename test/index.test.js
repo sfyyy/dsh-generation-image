@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { Buffer } from 'node:buffer'
+import { assertSupportedJsonSchema, JsonSchemaError } from '@deepseek-ai/dsh-tools'
 
 import {
   apply,
@@ -142,6 +143,34 @@ function createFakeCtx(config, overrides = {}) {
   return ctx
 }
 
+/**
+ * Mimic @deepseek-ai/cordis service resolution: reading a ctx property that is
+ * neither an own property nor in the plugin's `inject` list throws
+ * `cannot get property "<name>" without inject`. This is exactly the trap that
+ * crashed this plugin at startup when the shipped-skill block read `ctx.skills`
+ * ('skills' is not injected); services must be reached through `ctx.get(name)`.
+ */
+function createStrictCtx(config, extra = {}) {
+  const base = createFakeCtx(config)
+  const injected = new Set(['settings', 'credentials', 'attachments', 'llm', 'tools', 'systemPrompt'])
+  const injectedStubs = { systemPrompt: { section() {} }, ...(extra.injected || {}) }
+  const viaGet = { skills: extra.skills }
+  const originalGet = base.get
+  return new Proxy(base, {
+    get(target, prop, receiver) {
+      if (prop in target) {
+        const value = Reflect.get(target, prop, receiver)
+        if (prop === 'get') {
+          return (name) => (name === 'skills' ? viaGet.skills : originalGet(name))
+        }
+        return value
+      }
+      if (injected.has(prop)) return injectedStubs[prop]
+      throw new Error(`cannot get property "${String(prop)}" without inject`)
+    },
+  })
+}
+
 function fakeSession(messages, events = [], id = 's1') {
   return {
     id,
@@ -187,6 +216,64 @@ test('AC1: generate_image registers while enabled and is absent when disabled', 
     false,
     'disabled plugin must not register the tool',
   )
+})
+
+test('AC1.1: generate_image output schema is accepted by the real dsh-tools validator (regression)', async () => {
+  // tools.register() runs assertSupportedJsonSchema on output.schema; a schema
+  // that fails it throws and the tool silently never reaches the agent's tool
+  // list (seen in the field: per-property `required: true` was rejected).
+  const ctx = createFakeCtx(CONFIG)
+  await apply(ctx, { fetch: noNetworkFetch() })
+
+  const tool = ctx._tools.registered.find((d) => d.name === 'generate_image')
+  assert.ok(tool, 'generate_image must be registered while enabled')
+  assert.doesNotThrow(
+    () => assertSupportedJsonSchema(tool.output.schema),
+    (error) => `output.schema must pass assertSupportedJsonSchema; got ${error instanceof JsonSchemaError ? error.violations.join('; ') : String(error)}`,
+  )
+  // Semantics must be preserved: every documented field is still required.
+  assert.deepEqual(tool.output.schema.required, ['prompt', 'size', 'quality', 'count', 'images'])
+  assert.deepEqual(tool.output.schema.properties.images.items.required, [
+    'attachmentId',
+    'mediaType',
+    'bytes',
+    'width',
+    'height',
+  ])
+})
+
+test('AC1.2: apply must not crash on undeclared ctx access (regression: ctx.skills)', async () => {
+  // DSH's cordis throws `cannot get property "<name>" without inject` for any
+  // ctx property outside the plugin's inject list. The shipped-skill block
+  // used to read `ctx.skills` (not injected) and crashed the fiber at startup;
+  // the Settings route then vanished and the client fetch got the SPA HTML,
+  // failing with "Unexpected token '<', \"<!doctype \"... is not valid JSON".
+  // Skills must be read through ctx.get('skills') instead.
+  const registeredSkills = []
+  const ctx = createStrictCtx(CONFIG, {
+    skills: {
+      register(skill) {
+        registeredSkills.push(skill)
+        return () => {}
+      },
+    },
+  })
+
+  await assert.doesNotReject(
+    apply(ctx, { fetch: noNetworkFetch() }),
+    'apply must not throw on undeclared ctx.skills access',
+  )
+
+  // The shipped generate-image skill is registered through the safe path.
+  assert.equal(registeredSkills.length, 1, 'shipped skill must be registered via ctx.get("skills")')
+  assert.equal(registeredSkills[0].name, 'generate-image')
+  assert.ok(registeredSkills[0].content.length > 0, 'shipped skill body must be non-empty')
+
+  // The tool and Settings route are still wired up after the fix.
+  const tool = ctx._tools.registered.find((d) => d.name === 'generate_image')
+  assert.ok(tool, 'generate_image must still be registered')
+  assert.equal(ctx._routes.length, 1, 'settings route must still be registered')
+  assert.equal(ctx._routes[0].path, SETTINGS_ROUTE)
 })
 
 test('AC2: execute calls /images/generations (SSE), saves an attachment, renders image block', async () => {
@@ -253,6 +340,60 @@ test('AC2: execute calls /images/generations (SSE), saves an attachment, renders
   assert.ok(content[0].text.includes('a cat in a hat'))
   assert.equal(content[1].type, 'image')
   assert.equal(content[1].attachment.attachmentId, value.images[0].attachmentId)
+})
+
+test('AC2b: when the agent session can append, the image surfaces as a left-side assistant message (merged, no defer)', async () => {
+  // The DSH conversation renders image blocks in ASSISTANT messages on the
+  // left; deferContext only ever commits a user/message (right-side bubble).
+  // The tool must append an assistant/message that merges the step's original
+  // content with the generated image, and skip the user-bubble fallback.
+  const b64 = base64Of(PNG)
+  const ctx = createFakeCtx(CONFIG)
+  const deferred = []
+  const appended = []
+  // Seed the step's original assistant message so the merge has base content.
+  const events = [
+    { type: 'assistant/message', seq: 0, data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: 'original assistant text' }] } } },
+  ]
+  const session = {
+    id: 's-append',
+    events,
+    deriveMessages() { return [] },
+    append(type, data, opts) {
+      appended.push({ type, data, opts })
+      events.push({ type, seq: events.length, data })
+    },
+  }
+  await apply(ctx, {
+    fetch: async () => new Response(
+      JSON.stringify({ data: [{ b64_json: b64 }] }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    ),
+  })
+
+  const tool = ctx._tools.registered.find((d) => d.name === 'generate_image')
+  const value = await tool.execute(
+    { prompt: 'a puppy' },
+    {
+      agent: { session, phase: { turn: 1, step: 1 } },
+      deferContext(context) { deferred.push(context) },
+    },
+  )
+
+  // Assistant append path wins: no deferred user bubble is created.
+  assert.equal(deferred.length, 0, 'append path must not fall back to deferContext')
+  assert.equal(appended.length, 1, 'exactly one assistant/message must be appended')
+  assert.equal(appended[0].type, 'assistant/message')
+  assert.equal(appended[0].data.turn, 1)
+  assert.equal(appended[0].data.step, 1)
+  assert.equal(appended[0].opts.surfaceOp, 'append')
+
+  const content = appended[0].data.message.content
+  const imageBlocks = content.filter((block) => block.type === 'image')
+  assert.equal(imageBlocks.length, 1, 'the assistant message must carry the generated image block')
+  assert.equal(imageBlocks[0].attachment.attachmentId, value.images[0].attachmentId)
+  assert.equal(content[0].type, 'text', 'the step original text content is preserved (merged)')
+  assert.equal(content[0].text, 'original assistant text')
 })
 
 test('AC3: execute parses a plain JSON (non-streaming) response', async () => {
