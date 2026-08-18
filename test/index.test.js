@@ -305,6 +305,10 @@ test('AC1.2: apply must not crash on undeclared ctx access (regression: ctx.skil
   // The shipped generate-image skill is registered through the safe path.
   assert.equal(registeredSkills.length, 1, 'shipped skill must be registered via ctx.get("skills")')
   assert.equal(registeredSkills[0].name, 'generate-image')
+  // dsh-skill's loader requires a loaded definition to carry a string `source`
+  // (skills.register defaults `provider` and `invocation`, but not `source`).
+  assert.equal(typeof registeredSkills[0].source, 'string', 'shipped skill must carry a string source')
+  assert.equal(typeof registeredSkills[0].content, 'string', 'shipped skill content must be a string')
   assert.ok(registeredSkills[0].content.length > 0, 'shipped skill body must be non-empty')
   assert.match(registeredSkills[0].content, /referenceImageIds/)
   assert.match(registeredSkills[0].content, /upload/i)
