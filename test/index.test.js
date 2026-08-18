@@ -2,6 +2,8 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { Buffer } from 'node:buffer'
 import { assertSupportedJsonSchema, JsonSchemaError } from '@deepseek-ai/dsh-tools'
+import { createAssistantMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
+import { Session } from '@deepseek-ai/dsh-session'
 
 import {
   apply,
@@ -37,7 +39,10 @@ function base64Of(bytes) {
 }
 
 function makeImageBlock(id, name = 'generated-1.png') {
-  return { type: 'image', attachment: { attachmentId: id, mediaType: 'image/png', name } }
+  return {
+    type: 'image',
+    attachment: { attachmentId: id, mediaType: 'image/png', bytes: PNG.length, width: 1, height: 1, name },
+  }
 }
 
 function sseEvent(type, payload) {
@@ -51,7 +56,8 @@ function createFakeCtx(config, overrides = {}) {
   const credentials = new Map()
   const effects = []
   let active = true
-  const calls = { saveImage: [], requests: [] }
+  const calls = { saveImage: [], readImage: [], requests: [] }
+  const promptSections = []
 
   const effect = (install) => {
     const dispose = install()
@@ -85,6 +91,12 @@ function createFakeCtx(config, overrides = {}) {
 
   const ctx = {
     attachments: {
+      imageLimits: overrides.imageLimits ?? { maxImagesPerMessage: 4, maxMessageImageBytes: 50 * 1024 * 1024 },
+      async readImage(ref, signal) {
+        calls.readImage.push({ ref, signal })
+        if (overrides.readImage) return overrides.readImage(ref, signal)
+        return { ref, data: new Uint8Array(PNG) }
+      },
       async saveImage(input) {
         calls.saveImage.push(input)
         return {
@@ -106,6 +118,11 @@ function createFakeCtx(config, overrides = {}) {
       },
     },
     llm,
+    systemPrompt: {
+      section(definition) {
+        promptSections.push(definition)
+      },
+    },
     get settings() {
       if (!active) throw new Error('cannot get required service "settings" in inactive context')
       return settings
@@ -135,6 +152,7 @@ function createFakeCtx(config, overrides = {}) {
     _routes: routes,
     _tools: tools,
     _calls: calls,
+    _promptSections: promptSections,
     async _dispose() {
       while (effects.length > 0) await effects.pop()()
       active = false
@@ -196,6 +214,24 @@ const CONFIG = {
   quality: 'auto',
 }
 
+function modelSource(blockTypes) {
+  return {
+    provider: 'test-provider',
+    model: 'test-model',
+    replayState: {
+      response: {
+        kind: 'pi-ai',
+        version: 2,
+        api: 'openai-responses',
+        provider: 'test-provider',
+        model: 'test-model',
+        stopReason: 'toolUse',
+      },
+      blocks: blockTypes.map((type) => ({ type })),
+    },
+  }
+}
+
 // Isolate from any real ~/.dsh/generation-image.json on this machine.
 const PREV_CONFIG = process.env.DSH_GENERATION_IMAGE_CONFIG
 process.env.DSH_GENERATION_IMAGE_CONFIG = '/nonexistent/dsh-generation-image-test.json'
@@ -208,6 +244,8 @@ test('AC1: generate_image registers while enabled and is absent when disabled', 
   assert.ok(tool, 'generate_image must be registered while enabled')
   assert.ok(tool.parameters.required.includes('prompt'))
   assert.equal(tool.parameters.properties.count.maximum, 4)
+  assert.equal(tool.parameters.properties.referenceImageIds.type, 'array')
+  assert.equal(tool.parameters.properties.referenceImageIds.items.type, 'string')
 
   const disabled = createFakeCtx({ ...CONFIG, enabled: false })
   await apply(disabled, { fetch: noNetworkFetch() })
@@ -268,6 +306,13 @@ test('AC1.2: apply must not crash on undeclared ctx access (regression: ctx.skil
   assert.equal(registeredSkills.length, 1, 'shipped skill must be registered via ctx.get("skills")')
   assert.equal(registeredSkills[0].name, 'generate-image')
   assert.ok(registeredSkills[0].content.length > 0, 'shipped skill body must be non-empty')
+  assert.match(registeredSkills[0].content, /referenceImageIds/)
+  assert.match(registeredSkills[0].content, /upload/i)
+
+  const trigger = ctx._promptSections.find((section) => section.name === 'generate-image-trigger')
+  assert.ok(trigger, 'image generation trigger guidance must be registered')
+  assert.match(trigger.text(), /referenceImageIds/)
+  assert.match(trigger.text(), /ask the user to upload one/)
 
   // The tool and Settings route are still wired up after the fix.
   const tool = ctx._tools.registered.find((d) => d.name === 'generate_image')
@@ -312,14 +357,7 @@ test('AC2: execute calls /images/generations (SSE), saves an attachment, renders
   assert.equal(value.images[0].bytes, PNG.length)
   assert.equal(value.count, 1)
 
-  // The generated image must be deferred as a user-role context message so the
-  // conversation UI renders a thumbnail (bare tool-result images are not
-  // rendered by the DSH web UI).
-  assert.equal(deferred.length, 1, 'root calls must defer the image into context')
-  assert.equal(deferred[0].content[0].type, 'text')
-  assert.equal(deferred[0].content[1].type, 'image')
-  assert.equal(deferred[0].content[1].attachment.attachmentId, value.images[0].attachmentId)
-  assert.equal(deferred[0].source.plugin, 'generation-image')
+  assert.equal(deferred.length, 0, 'image generation must never create a right-side user context')
 
   assert.equal(seen.length, 1)
   assert.match(seen[0].url, /\/images\/generations$/)
@@ -342,28 +380,25 @@ test('AC2: execute calls /images/generations (SSE), saves an attachment, renders
   assert.equal(content[1].attachment.attachmentId, value.images[0].attachmentId)
 })
 
-test('AC2b: when the agent session can append, the image surfaces as a left-side assistant message (merged, no defer)', async () => {
-  // The DSH conversation renders image blocks in ASSISTANT messages on the
-  // left; deferContext only ever commits a user/message (right-side bubble).
-  // The tool must append an assistant/message that merges the step's original
-  // content with the generated image, and skip the user-bubble fallback.
+test('AC2b: generated image displays on the left without duplicating model-visible tool calls', async () => {
   const b64 = base64Of(PNG)
   const ctx = createFakeCtx(CONFIG)
   const deferred = []
-  const appended = []
-  // Seed the step's original assistant message so the merge has base content.
-  const events = [
-    { type: 'assistant/message', seq: 0, data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: 'original assistant text' }] } } },
-  ]
-  const session = {
-    id: 's-append',
-    events,
-    deriveMessages() { return [] },
-    append(type, data, opts) {
-      appended.push({ type, data, opts })
-      events.push({ type, seq: events.length, data })
+  const session = Session.create('s-left-image')
+  const callId = 'call-left-image'
+  const source = modelSource(['text', 'tool-call'])
+  const original = session.append(
+    'assistant/message',
+    {
+      turn: 1,
+      step: 1,
+      message: createAssistantMessage({ source, content: [
+        { type: 'text', text: 'original assistant text' },
+        { type: 'tool-call', id: callId, name: 'generate_image', arguments: '{"prompt":"a puppy"}' },
+      ] }),
     },
-  }
+    { surfaceOp: 'append' },
+  )
   await apply(ctx, {
     fetch: async () => new Response(
       JSON.stringify({ data: [{ b64_json: b64 }] }),
@@ -380,20 +415,127 @@ test('AC2b: when the agent session can append, the image surfaces as a left-side
     },
   )
 
-  // Assistant append path wins: no deferred user bubble is created.
-  assert.equal(deferred.length, 0, 'append path must not fall back to deferContext')
-  assert.equal(appended.length, 1, 'exactly one assistant/message must be appended')
-  assert.equal(appended[0].type, 'assistant/message')
-  assert.equal(appended[0].data.turn, 1)
-  assert.equal(appended[0].data.step, 1)
-  assert.equal(appended[0].opts.surfaceOp, 'append')
+  assert.equal(deferred.length, 0, 'left-side display must not fall back to deferContext')
+  const assistantEvents = session.events.filter((event) => event.type === 'assistant/message')
+  assert.equal(assistantEvents.length, 3, 'original, UI append, and model-surface replacement')
+  const display = assistantEvents[1]
+  const replacement = assistantEvents[2]
+  assert.equal(display.surfaceOp, 'append', 'the UI consumes the append event')
+  assert.equal(display.data.message.content.filter((block) => block.type === 'image').length, 1)
+  assert.equal(display.data.message.source.replayState, undefined, 'changed UI content must not claim replay fidelity')
+  assert.deepEqual(replacement.surfaceOp, { op: 'replace', start: original.seq, end: display.seq })
+  assert.deepEqual(replacement.sourceEventSeqs, [original.seq, display.seq])
+  assert.deepEqual(replacement.data.message.source, original.data.message.source)
+  assert.deepEqual(replacement.data.message.content, original.data.message.content)
+  assert.doesNotThrow(
+    () => Session.create('s-left-image-reload', session.events),
+    'persisted replacement events must remain valid after session reload',
+  )
 
-  const content = appended[0].data.message.content
+  const derived = session.deriveMessages()
+  assert.equal(derived.length, 1, 'the model surface keeps one assistant message')
+  const content = derived[0].content
   const imageBlocks = content.filter((block) => block.type === 'image')
-  assert.equal(imageBlocks.length, 1, 'the assistant message must carry the generated image block')
-  assert.equal(imageBlocks[0].attachment.attachmentId, value.images[0].attachmentId)
+  assert.equal(imageBlocks.length, 0, 'UI-only image blocks must not alter model replay content')
+  const displayImage = display.data.message.content.find((block) => block.type === 'image')
+  assert.equal(displayImage.attachment.attachmentId, value.images[0].attachmentId)
   assert.equal(content[0].type, 'text', 'the step original text content is preserved (merged)')
   assert.equal(content[0].text, 'original assistant text')
+  assert.equal(content.filter((block) => block.type === 'tool-call').length, 1)
+})
+
+test('AC2c: four out-of-order concurrent generations keep one call set and four left-side images', async () => {
+  const b64 = base64Of(PNG)
+  const ctx = createFakeCtx(CONFIG)
+  const delays = new Map([['one', 30], ['two', 5], ['three', 20], ['four', 10]])
+  await apply(ctx, {
+    fetch: async (_url, init) => {
+      const prompt = JSON.parse(init.body).prompt
+      await new Promise((resolve) => setTimeout(resolve, delays.get(prompt)))
+      return new Response(
+        JSON.stringify({ data: [{ b64_json: b64 }] }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      )
+    },
+  })
+
+  const tool = ctx._tools.registered.find((d) => d.name === 'generate_image')
+  const prompts = ['one', 'two', 'three', 'four']
+  const callIds = prompts.map((prompt) => `call-${prompt}`)
+  const session = Session.create('s-concurrent-left-images')
+  const source = modelSource(callIds.map(() => 'tool-call'))
+  session.append(
+    'assistant/message',
+    {
+      turn: 1,
+      step: 1,
+      message: createAssistantMessage({ source, content: callIds.map((id, index) => ({
+        type: 'tool-call',
+        id,
+        name: 'generate_image',
+        arguments: JSON.stringify({ prompt: prompts[index] }),
+      })) }),
+    },
+    { surfaceOp: 'append' },
+  )
+
+  const deferred = []
+  const values = await Promise.all(prompts.map((prompt) => tool.execute(
+    { prompt },
+    {
+      agent: { session, phase: { turn: 1, step: 1 } },
+      deferContext(context) { deferred.push(context) },
+    },
+  )))
+
+  for (let i = 0; i < callIds.length; i++) {
+    session.append(
+      'tool/result',
+      {
+        turn: 1,
+        step: 1,
+        message: createToolResultMessage({
+          callId: callIds[i],
+          content: tool.output.render({}, values[i]),
+          isError: false,
+        }),
+      },
+      { surfaceOp: 'append' },
+    )
+  }
+
+  assert.equal(deferred.length, 0)
+  const derived = session.deriveMessages()
+  const assistants = derived.filter((message) => message.role === 'assistant')
+  assert.equal(assistants.length, 1, 'all UI appends must fold into one model assistant message')
+  assert.deepEqual(
+    assistants[0].content.filter((block) => block.type === 'tool-call').map((block) => block.id),
+    callIds,
+  )
+  assert.equal(assistants[0].content.filter((block) => block.type === 'image').length, 0)
+
+  const displayEvents = session.events.filter(
+    (event) => event.type === 'assistant/message' && event.surfaceOp === 'append'
+      && event.data.message.content.some((block) => block.type === 'image'),
+  )
+  const images = displayEvents.at(-1).data.message.content.filter((block) => block.type === 'image')
+  assert.equal(displayEvents.length, 4)
+  assert.equal(images.length, 4)
+  assert.equal(new Set(images.map((block) => block.attachment.attachmentId)).size, 4)
+
+  const results = derived.flatMap((message) => message.content.filter((block) => block.type === 'tool-result'))
+  assert.deepEqual(results.map((result) => result.toolCallId), callIds)
+  assert.equal(session.events.filter((event) => event.type === 'assistant/message' && event.surfaceOp === 'append').length, 5)
+  assert.equal(session.events.filter((event) => event.type === 'assistant/message' && event.surfaceOp !== 'append').length, 4)
+  const finalReplacement = session.events.filter(
+    (event) => event.type === 'assistant/message' && event.surfaceOp !== 'append',
+  ).at(-1)
+  assert.deepEqual(finalReplacement.data.message.source, session.events[0].data.message.source)
+  assert.deepEqual(finalReplacement.data.message.content, session.events[0].data.message.content)
+  assert.doesNotThrow(
+    () => Session.create('s-concurrent-left-images-reload', session.events),
+    'concurrent replacement history must remain valid after session reload',
+  )
 })
 
 test('AC3: execute parses a plain JSON (non-streaming) response', async () => {
@@ -415,7 +557,100 @@ test('AC3: execute parses a plain JSON (non-streaming) response', async () => {
   assert.equal(value.images[0].mediaType, 'image/png')
 })
 
-test('AC3b: size/quality are unrestricted — auto/empty is omitted, custom values pass through', async () => {
+test('AC3a: referenceImageIds sends ordered verified images to /images/edits and parses JSON or SSE', async () => {
+  const b64 = base64Of(PNG)
+  const firstId = AID('r1')
+  const secondId = AID('r2')
+  const session = fakeSession([], [{
+    type: 'user/message',
+    data: { message: { content: [makeImageBlock(firstId, 'first.png'), makeImageBlock(secondId, 'second.png')] } },
+  }])
+  const seen = []
+  const ctx = createFakeCtx(CONFIG, {
+    readImage(ref) {
+      const marker = ref.attachmentId === firstId ? 1 : 2
+      return { ref, data: new Uint8Array([...PNG, marker]) }
+    },
+  })
+  await apply(ctx, {
+    fetch: async (url, init) => {
+      seen.push({ url, init })
+      if (seen.length === 2) {
+        return new Response(
+          sseEvent('image_edit.completed', { b64_json: b64 }),
+          { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+        )
+      }
+      return new Response(
+        JSON.stringify({ data: [{ b64_json: b64 }] }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      )
+    },
+  })
+
+  const tool = ctx._tools.registered.find((d) => d.name === 'generate_image')
+  const value = await tool.execute(
+    {
+      prompt: 'combine both references on a white background',
+      referenceImageIds: [secondId, firstId],
+      size: '1024x1024',
+      quality: 'high',
+      count: 2,
+    },
+    { agent: { session }, signal: new AbortController().signal },
+  )
+  const streamed = await tool.execute(
+    { prompt: 'restyle the first reference', referenceImageIds: [firstId] },
+    { agent: { session } },
+  )
+
+  assert.equal(value.images.length, 1)
+  assert.equal(streamed.images.length, 1)
+  assert.equal(seen.length, 2)
+  assert.match(seen[0].url, /\/images\/edits$/)
+  assert.equal(seen[0].init.headers.Authorization, 'Bearer test-key')
+  assert.equal(seen[0].init.headers['Content-Type'], undefined, 'fetch must add the multipart boundary')
+  const form = seen[0].init.body
+  assert.ok(form instanceof FormData)
+  assert.equal(form.get('model'), 'gpt-image-2')
+  assert.equal(form.get('prompt'), 'combine both references on a white background')
+  assert.equal(form.get('n'), '2')
+  assert.equal(form.get('size'), '1024x1024')
+  assert.equal(form.get('quality'), 'high')
+  assert.equal(form.get('stream'), 'true')
+  assert.equal(form.get('partial_images'), '1')
+  const files = form.getAll('image[]')
+  assert.deepEqual(files.map((file) => file.name), ['second.png', 'first.png'])
+  assert.deepEqual(
+    await Promise.all(files.map(async (file) => [...new Uint8Array(await file.arrayBuffer())].slice(-1)[0])),
+    [2, 1],
+  )
+  assert.deepEqual(ctx._calls.readImage.map((call) => call.ref.attachmentId), [secondId, firstId, firstId])
+})
+
+test('AC3b: invalid reference image lists fail before attachment reads or network I/O', async () => {
+  const firstId = AID('r1')
+  const secondId = AID('r2')
+  const missingId = AID('missing')
+  const session = fakeSession([], [{
+    type: 'user/message',
+    data: { message: { content: [makeImageBlock(firstId), makeImageBlock(secondId)] } },
+  }])
+  let fetches = 0
+  const ctx = createFakeCtx(CONFIG, { imageLimits: { maxImagesPerMessage: 1 } })
+  await apply(ctx, { fetch: async () => { fetches++; throw new Error('must not fetch') } })
+  const tool = ctx._tools.registered.find((d) => d.name === 'generate_image')
+  const exec = { agent: { session } }
+
+  await assert.rejects(tool.execute({ prompt: 'edit', referenceImageIds: [] }, exec), /at least one/)
+  await assert.rejects(tool.execute({ prompt: 'edit', referenceImageIds: [firstId, firstId] }, exec), /duplicates/)
+  await assert.rejects(tool.execute({ prompt: 'edit', referenceImageIds: [firstId, secondId] }, exec), /1-image session limit/)
+  await assert.rejects(tool.execute({ prompt: 'edit', referenceImageIds: [missingId] }, exec), /not available in this session/)
+  assert.equal(ctx._calls.readImage.length, 0)
+  assert.equal(fetches, 0)
+})
+
+test('AC3c: size/quality are unrestricted — auto/empty is omitted, custom values pass through', async () => {
   const b64 = base64Of(PNG)
   const seen = []
   const ctx = createFakeCtx({ ...CONFIG, size: '', quality: 'auto' })
@@ -461,7 +696,7 @@ test('AC3b: size/quality are unrestricted — auto/empty is omitted, custom valu
   assert.equal(request.quality, 'hd')
 })
 
-test('AC4: nested (run_code) dispatch defers the image back into context', async () => {
+test('AC4: nested (run_code) dispatch does not create a right-side image context', async () => {
   const b64 = base64Of(PNG)
   const ctx = createFakeCtx(CONFIG)
   const deferred = []
@@ -483,10 +718,7 @@ test('AC4: nested (run_code) dispatch defers the image back into context', async
       },
     },
   )
-  assert.equal(deferred.length, 1, 'nested dispatch must defer the image context')
-  assert.equal(deferred[0].content[0].type, 'text')
-  assert.equal(deferred[0].content[1].type, 'image')
-  assert.equal(deferred[0].source.plugin, 'generation-image')
+  assert.equal(deferred.length, 0, 'nested dispatch must not create a right-side user bubble')
 })
 
 test('parseSseImages: completed wins, [DONE] ignored, errors throw', () => {

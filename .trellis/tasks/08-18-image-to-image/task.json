@@ -1,0 +1,32 @@
+{
+  "id": "image-to-image",
+  "name": "image-to-image",
+  "title": "支持图生图并完善 Skill 指引",
+  "description": "为 generate_image 增加会话附件驱动的图生图能力，并完善 SKILL 使用指引。",
+  "status": "in_progress",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "sfyyy",
+  "assignee": "sfyyy",
+  "createdAt": "2026-08-18",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [
+    "lib/index.js",
+    "skills/generate-image/SKILL.md",
+    "test/index.test.js",
+    "README.md",
+    "README.zh-CN.md"
+  ],
+  "notes": "",
+  "meta": {}
+}

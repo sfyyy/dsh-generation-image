@@ -43,4 +43,4 @@ The goal is to help AI assistants and new team members understand how YOUR proje
 
 | Guide | Description | Status |
 |-------|-------------|--------|
-| [DSH Bundle Plugin](./dsh-plugin.md) | Host/client architecture, config contract, `generate_image` tool, marker rewrite + admission bypass, error matrix | ✅ Filled |
+| [DSH Bundle Plugin](./dsh-plugin.md) | Host/client architecture, text/image-to-image contracts, attachment isolation, marker rewrite + admission bypass, error matrix | ✅ Filled |

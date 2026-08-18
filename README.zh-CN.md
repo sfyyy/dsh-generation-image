@@ -11,12 +11,13 @@
 
 这个 DSH 插件让 **DeepSeek 会话具备按需图像生成能力**：agent 获得一个
 `generate_image` 工具，调用**你自己的** OpenAI 兼容图像 URL + API Key
-（`POST /images/generations`），并把生成的图片送回会话。
+（`POST /images/generations` 或 `/images/edits`），并把生成的图片送回会话。
 
-- **自带图像端点** — 任何 OpenAI 兼容的 `/images/generations` 服务（OpenAI、
-  xiaoyaoapi、vLLM 图像模型、本地网关……）。
+- **文生图与图生图** — 可从提示词生成图片，也可通过 OpenAI 兼容
+  `/images/edits` 端点编辑或组合一张、多张 DSH 图片附件。
+- **自带图像端点** — OpenAI、xiaoyaoapi、vLLM 图像模型、本地网关等兼容服务。
 - **图片进入会话界面** — 生成的字节会通过 DSH attachment 服务持久化保存，
-  并以用户消息的形式放进会话，渲染成可点击的**缩略图**。点击可**放大**，
+  并以 assistant 左侧消息的形式放进会话，渲染成可点击的**缩略图**。点击可**放大**，
   放大后可**下载或关闭**。
 - **文本模型保持安全** — DeepSeek 是纯文本模型，因此每次文本模型请求都会把
   image 块改写成文字标记（与
@@ -29,12 +30,12 @@
 ## 工作原理
 
 ```text
-agent 调用 generate_image(prompt, size?, quality?, count?)
+agent 调用 generate_image(prompt, size?, quality?, count?, referenceImageIds?)
    │
    ▼
-POST {baseUrl}/images/generations      (Bearer <apiKey>)
-   body: { model, prompt, response_format: "b64_json", n: count,
-           size, quality, stream: true, partial_images: 1 }
+未传 referenceImageIds → POST {baseUrl}/images/generations（JSON）
+传入 referenceImageIds → attachments.readImage() → POST {baseUrl}/images/edits
+                       （multipart，重复 image[] 字段）
    │
    ▼
 SSE（image_generation.partial_image / .completed → b64_json）
@@ -44,7 +45,7 @@ SSE（image_generation.partial_image / .completed → b64_json）
 magic bytes 识别格式 → attachments.saveImage() → 持久化图片引用
    │
    ▼
-工具结果：文字摘要 + image 块，并追加一条用户角色图片消息
+工具结果：文字摘要 + image 块，并追加一条 assistant 左侧展示消息
 → 会话中渲染为可点击缩略图
    │
    ▼
@@ -57,7 +58,7 @@ llm.resolveModelInfo 放行补丁让消息能进入 agent。
 
 ## 查看生成的图片
 
-DSH Web 会把每张生成的图片渲染成会话里的**缩略图**（用户角色图片消息）。
+DSH Web 会把每张生成的图片渲染成会话左侧的**缩略图**（assistant 图片消息）。
 点击缩略图即可打开放大的灯箱：
 
 - **下载原图** — 本插件客户端在放大视图右上角注入的下载按钮，把高清原图保存
@@ -119,7 +120,8 @@ dsh plugin inject /path/to/dsh-generation-image
 ```
 
 - `baseUrl` — OpenAI 兼容图像 API 根地址（`.../v1`）；**默认为空**，插件会规范
-  化并调用 `${baseUrl}/images/generations`。
+  化并根据工具参数调用 `${baseUrl}/images/generations` 或
+  `${baseUrl}/images/edits`。
 - `apiKey` / `apiKeyEnv` — **默认为空**，二者互斥。直接填写的 key 会同步到
   DSH 凭据库，并以 `DSH_GENERATION_IMAGE_API_KEY` 引用。
 - `model` — 图像模型 id（默认 `gpt-image-2`）。
@@ -146,11 +148,16 @@ dsh plugin inject /path/to/dsh-generation-image
   - `quality`（可选，**不限制**）：常见值 `auto`（默认）、`low`、`medium`、
     `high`，或端点接受的任意值；
   - `count`（可选，1–4）：生成几张图片（默认 1）。
+  - `referenceImageIds`（可选）：当前会话中有序且不重复的图片附件 id。文生图时
+    省略；图生图或组合多张参考图时传入一张或多张，数量受当前 DSH 图片策略限制。
 - **行为**：调用配置的图像端点 → 解析 SSE 流（或普通 JSON）→ 用 magic
   bytes 识别真实格式 → 通过 DSH attachment 服务持久化每张图 → 返回文字摘要
   加每张图一个 image 块。
 - **结果**：生成的图片出现在会话日志与 Web 界面；文本模型收到的是文字标记
   而非 image 块。
+- **图生图用法**：上传一张或多张图片后，直接要求修改、换风格或组合。内置 Skill
+  会读取图片 marker 中的附件 id 并传入 `referenceImageIds`；没有参考图片时会先
+  请用户上传，不会静默退化为文生图。
 
 ## 验证
 
@@ -158,8 +165,9 @@ dsh plugin inject /path/to/dsh-generation-image
 npm test
 ```
 
-测试覆盖：工具注册开关、图像 API 调用（SSE + 普通 JSON）、规范化返回值与渲染
-输出、嵌套 `run_code` 的上下文回传、图片标记改写（会话日志保持不变）、放行
+测试覆盖：工具注册开关、图像 API 调用（SSE + 普通 JSON）、多参考图
+`/images/edits` multipart 请求、附件隔离、规范化返回值与渲染输出、嵌套
+`run_code` 行为、图片标记改写（会话日志保持不变）、放行
 补丁开关、下游工具过滤后的可见性、禁用行为、配置/环境变量优先级。
 
 ## 开发
@@ -173,7 +181,7 @@ dsh plugin inject /path/to/dsh-generation-image
 ## 搜索关键词
 
 `deepseek` · `deepseek-harness` · `dsh` · `plugin` · `image generation` ·
-`text-to-image` · `generate image` · `gpt-image` · `OpenAI-compatible` ·
+`text-to-image` · `image-to-image` · `img2img` · `generate image` · `gpt-image` · `OpenAI-compatible` ·
 `images API` · `xiaoyaoapi` · `LLM agent`
 
 ## License
