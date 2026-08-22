@@ -12,8 +12,11 @@ import {
   contentHasImage,
   sniffMediaType,
   parseSseImages,
+  parseSseImageItems,
   extractB64FromJson,
+  extractImageItemsFromJson,
   decodeImages,
+  resolveImageItems,
   resolveBaseUrl,
   resolveApiKey,
   resolveConfig,
@@ -758,6 +761,149 @@ test('extractB64FromJson: reads data[].b64_json and skips url-only items', () =>
   )
   assert.deepEqual(extractB64FromJson({}), [])
   assert.deepEqual(extractB64FromJson({ data: [] }), [])
+})
+
+test('parseSseImageItems: collects b64 and url events, completed wins', () => {
+  const b64 = base64Of(PNG)
+  // partial url + completed url → completed wins
+  const items = parseSseImageItems(
+    sseEvent('image_generation.partial_image', { url: 'https://e/p.png' })
+    + sseEvent('image_generation.completed', { url: 'https://e/final.png' }),
+  )
+  assert.deepEqual(items, [{ kind: 'url', url: 'https://e/final.png' }])
+
+  // mixed b64 + url completed events keep order
+  const mixed = parseSseImageItems(
+    sseEvent('image_generation.completed', { b64_json: b64 })
+    + sseEvent('image_generation.completed', { url: 'https://e/second.png' }),
+  )
+  assert.deepEqual(mixed, [
+    { kind: 'b64', data: b64 },
+    { kind: 'url', url: 'https://e/second.png' },
+  ])
+
+  // url-only partial still falls back
+  const onlyPartial = parseSseImageItems(sseEvent('image_generation.partial_image', { url: 'https://e/p.png' }))
+  assert.deepEqual(onlyPartial, [{ kind: 'url', url: 'https://e/p.png' }])
+})
+
+test('extractImageItemsFromJson: reads b64_json and url, tolerates bare url strings', () => {
+  assert.deepEqual(
+    extractImageItemsFromJson({ data: [{ b64_json: 'x' }, { url: 'https://e/x.png' }, 'https://e/y.png'] }),
+    [
+      { kind: 'b64', data: 'x' },
+      { kind: 'url', url: 'https://e/x.png' },
+      { kind: 'url', url: 'https://e/y.png' },
+    ],
+  )
+  assert.deepEqual(extractImageItemsFromJson({}), [])
+  assert.deepEqual(extractImageItemsFromJson({ data: [] }), [])
+})
+
+test('resolveImageItems: decodes b64 and downloads url (deduped)', async () => {
+  const b64 = base64Of(PNG)
+  let downloads = 0
+  const resolved = await resolveImageItems(
+    [
+      { kind: 'b64', data: b64 },
+      { kind: 'url', url: 'https://e/out.png' },
+      { kind: 'url', url: 'https://e/out.png' }, // dedup: downloaded once
+    ],
+    {
+      fetch: async (url) => {
+        downloads++
+        assert.equal(url, 'https://e/out.png')
+        return new Response(PNG, { status: 200, headers: { 'Content-Type': 'image/png' } })
+      },
+    },
+  )
+  assert.equal(resolved.length, 2)
+  assert.equal(resolved[0].mediaType, 'image/png')
+  assert.deepEqual(resolved[0].data, new Uint8Array(PNG))
+  assert.equal(resolved[1].mediaType, 'image/png')
+  assert.equal(downloads, 1)
+})
+
+test('AC2d: execute downloads SSE url payloads and saves an attachment', async () => {
+  const ctx = createFakeCtx(CONFIG)
+  const seen = []
+  await apply(ctx, {
+    fetch: async (url, init) => {
+      seen.push({ url, init })
+      if (seen.length === 1) {
+        return new Response(
+          sseEvent('image_generation.completed', { url: 'https://img.example.com/out.png' })
+          + 'data: [DONE]\n\n',
+          { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+        )
+      }
+      assert.equal(url, 'https://img.example.com/out.png', 'second fetch must download the image URL')
+      return new Response(PNG, { status: 200, headers: { 'Content-Type': 'image/png' } })
+    },
+  })
+
+  const tool = ctx._tools.registered.find((d) => d.name === 'generate_image')
+  const value = await tool.execute(
+    { prompt: 'a red ball' },
+    { agent: { session: fakeSession([]) } },
+  )
+  assert.equal(value.images.length, 1)
+  assert.equal(value.images[0].mediaType, 'image/png')
+  assert.equal(value.images[0].bytes, PNG.length)
+  assert.equal(seen.length, 2, 'one generation POST + one URL download')
+  assert.equal(ctx._calls.saveImage.length, 1, 'downloaded image must be saved as an attachment')
+})
+
+test('AC3d: execute downloads plain JSON url payloads', async () => {
+  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0x00, 0, 0, 0, 0, 0, 0, 0, 0])
+  const ctx = createFakeCtx(CONFIG)
+  const seen = []
+  await apply(ctx, {
+    fetch: async (url, init) => {
+      seen.push({ url, init })
+      if (seen.length === 1) {
+        return new Response(
+          JSON.stringify({ data: [{ url: 'https://img.example.com/out.jpg' }] }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      }
+      assert.equal(url, 'https://img.example.com/out.jpg')
+      return new Response(jpeg, { status: 200, headers: { 'Content-Type': 'image/jpeg' } })
+    },
+  })
+
+  const tool = ctx._tools.registered.find((d) => d.name === 'generate_image')
+  const value = await tool.execute(
+    { prompt: 'a blue sky' },
+    { agent: { session: fakeSession([]) } },
+  )
+  assert.equal(value.images.length, 1)
+  assert.equal(value.images[0].mediaType, 'image/jpeg')
+  assert.equal(seen.length, 2)
+})
+
+test('AC2e: a failing URL download surfaces a readable error', async () => {
+  const ctx = createFakeCtx(CONFIG)
+  let fetchCalls = 0
+  await apply(ctx, {
+    fetch: async (url) => {
+      fetchCalls++
+      if (fetchCalls === 1) {
+        return new Response(
+          sseEvent('image_generation.completed', { url: 'https://img.example.com/broken.png' })
+          + 'data: [DONE]\n\n',
+          { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+        )
+      }
+      return new Response('bad gateway', { status: 502 })
+    },
+  })
+
+  const tool = ctx._tools.registered.find((d) => d.name === 'generate_image')
+  await assert.rejects(
+    tool.execute({ prompt: 'a broken link' }, { agent: { session: fakeSession([]) } }),
+    /failed to download the generated image from https:\/\/img\.example\.com\/broken\.png/,
+  )
 })
 
 test('sniffMediaType: PNG/JPEG/WebP/GIF magic bytes', () => {

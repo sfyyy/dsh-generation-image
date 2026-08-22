@@ -26,6 +26,9 @@
 - **沿用 GPT2Image 验证过的请求形态** — `stream: true`、`partial_images: 1`、
   SSE `image_generation.completed` 事件（并兼容普通 JSON 响应），即 GPT2Image
   使用的端点（`https://api.xiaoyaoapi.cc/v1`，模型 `gpt-image-2`）。
+- **同时兼容 b64_json 与 url 结果** — 内联返回图片的渠道（SSE 或普通 JSON 的
+  `b64_json`）照常工作；返回远程 `url` 的渠道（如 `data[].url` 或 SSE 事件里的
+  `url` 字段）会自动下载图片字节后再保存为附件，无需额外配置。
 
 ## 工作原理
 
@@ -38,9 +41,9 @@ agent 调用 generate_image(prompt, size?, quality?, count?, referenceImageIds?)
                        （multipart，重复 image[] 字段）
    │
    ▼
-SSE（image_generation.partial_image / .completed → b64_json）
-   或普通 JSON（data[].b64_json）
-   │
+SSE（image_generation.partial_image / .completed → b64_json 或 url）
+   或普通 JSON（data[].b64_json / data[].url）
+   │                        （url 结果会自动下载）
    ▼
 magic bytes 识别格式 → attachments.saveImage() → 持久化图片引用
    │

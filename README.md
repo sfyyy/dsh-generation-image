@@ -31,6 +31,10 @@ the generated image into the session.
   `partial_images: 1`, SSE `image_generation.completed` events (with a plain
   JSON fallback), the exact endpoint used by the GPT2Image app
   (`https://api.xiaoyaoapi.cc/v1`, model `gpt-image-2`).
+- **b64_json and url results both supported** — channels that return the image
+  inline (`b64_json`, SSE or plain JSON) work as before; channels that return a
+  remote `url` (e.g. `data[].url` or url-carrying SSE events) are handled
+  transparently by downloading the image bytes before saving the attachment.
 
 ## How it works
 
@@ -43,9 +47,9 @@ referenceImageIds provided → attachments.readImage() → POST {baseUrl}/images
                              (multipart, repeated image[] fields)
    │
    ▼
-SSE (image_generation.partial_image / .completed → b64_json)
-   or plain JSON (data[].b64_json)
-   │
+SSE (image_generation.partial_image / .completed → b64_json or url)
+   or plain JSON (data[].b64_json / data[].url)
+   │                        (url results are downloaded automatically)
    ▼
 magic-byte sniff → attachments.saveImage() → durable image ref
    │
