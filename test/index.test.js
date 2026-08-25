@@ -18,10 +18,12 @@ import {
   decodeImages,
   resolveImageItems,
   resolveBaseUrl,
+  normalizeRequestedSize,
   resolveApiKey,
   resolveConfig,
   rewriteImageBlocksToMarkers,
   formatGenerationEnvelope,
+  generateImagesFromApi,
 } from '../lib/index.js'
 
 /** A minimal valid PNG header (>= 12 bytes so sniffMediaType can decide). */
@@ -283,6 +285,30 @@ test('AC1.1: generate_image output schema is accepted by the real dsh-tools vali
   ])
 })
 
+test('AC1.1b: count > 1 is split into multiple n=1 API requests', async () => {
+  const b64 = base64Of(PNG)
+  const seen = []
+  const images = await generateImagesFromApi(
+    { ...CONFIG, prompt: 'four versions', count: 2 },
+    {
+      fetch: async (url, init) => {
+        seen.push({ url, init })
+        return new Response(
+          JSON.stringify({ data: [{ b64_json: b64 }] }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      },
+    },
+  )
+
+  assert.equal(seen.length, 2, 'count > 1 must issue one n=1 request per image')
+  for (const { init } of seen) {
+    const body = JSON.parse(init.body)
+    assert.equal(body.n, 1, 'every split request must use n=1')
+  }
+  assert.equal(images.length, 2)
+})
+
 test('AC1.2: apply must not crash on undeclared ctx access (regression: ctx.skills)', async () => {
   // DSH's cordis throws `cannot get property "<name>" without inject` for any
   // ctx property outside the plugin's inject list. The shipped-skill block
@@ -487,29 +513,32 @@ test('AC2c: four out-of-order concurrent generations keep one call set and four 
   )
 
   const deferred = []
-  const values = await Promise.all(prompts.map((prompt) => tool.execute(
-    { prompt },
-    {
-      agent: { session, phase: { turn: 1, step: 1 } },
-      deferContext(context) { deferred.push(context) },
-    },
-  )))
-
-  for (let i = 0; i < callIds.length; i++) {
+  const values = await Promise.all(prompts.map(async (prompt, index) => {
+    const value = await tool.execute(
+      { prompt },
+      {
+        agent: { session, phase: { turn: 1, step: 1 } },
+        deferContext(context) { deferred.push(context) },
+      },
+    )
+    // Append each tool result as soon as its generation finishes, so later
+    // concurrent calls see an interleaved tool/result surface (the real-world
+    // parallel-call ordering that previously dropped later display images).
     session.append(
       'tool/result',
       {
         turn: 1,
         step: 1,
         message: createToolResultMessage({
-          callId: callIds[i],
-          content: tool.output.render({}, values[i]),
+          callId: callIds[index],
+          content: tool.output.render({}, value),
           isError: false,
         }),
       },
       { surfaceOp: 'append' },
     )
-  }
+    return value
+  }))
 
   assert.equal(deferred.length, 0)
   const derived = session.deriveMessages()
@@ -531,14 +560,22 @@ test('AC2c: four out-of-order concurrent generations keep one call set and four 
   assert.equal(new Set(images.map((block) => block.attachment.attachmentId)).size, 4)
 
   const results = derived.flatMap((message) => message.content.filter((block) => block.type === 'tool-result'))
-  assert.deepEqual(results.map((result) => result.toolCallId), callIds)
+  assert.deepEqual(
+    results.map((result) => result.toolCallId).sort(),
+    [...callIds].sort(),
+    'all tool results must remain on the model surface regardless of completion order',
+  )
   assert.equal(session.events.filter((event) => event.type === 'assistant/message' && event.surfaceOp === 'append').length, 5)
   assert.equal(session.events.filter((event) => event.type === 'assistant/message' && event.surfaceOp !== 'append').length, 4)
   const finalReplacement = session.events.filter(
     (event) => event.type === 'assistant/message' && event.surfaceOp !== 'append',
   ).at(-1)
   assert.deepEqual(finalReplacement.data.message.source, session.events[0].data.message.source)
-  assert.deepEqual(finalReplacement.data.message.content, session.events[0].data.message.content)
+  assert.deepEqual(
+    finalReplacement.data.message.content,
+    [],
+    'interleaved calls shadow only the latest display append with an empty model-only message',
+  )
   assert.doesNotThrow(
     () => Session.create('s-concurrent-left-images-reload', session.events),
     'concurrent replacement history must remain valid after session reload',
@@ -602,7 +639,7 @@ test('AC3a: referenceImageIds sends ordered verified images to /images/edits and
       referenceImageIds: [secondId, firstId],
       size: '1024x1024',
       quality: 'high',
-      count: 2,
+      count: 1,
     },
     { agent: { session }, signal: new AbortController().signal },
   )
@@ -621,7 +658,7 @@ test('AC3a: referenceImageIds sends ordered verified images to /images/edits and
   assert.ok(form instanceof FormData)
   assert.equal(form.get('model'), 'gpt-image-2')
   assert.equal(form.get('prompt'), 'combine both references on a white background')
-  assert.equal(form.get('n'), '2')
+  assert.equal(form.get('n'), '1')
   assert.equal(form.get('size'), '1024x1024')
   assert.equal(form.get('quality'), 'high')
   assert.equal(form.get('stream'), 'true')
@@ -1009,6 +1046,15 @@ test('resolveBaseUrl normalizes image API roots', () => {
   assert.equal(resolveBaseUrl('https://api.xiaoyaoapi.cc/v1/'), 'https://api.xiaoyaoapi.cc/v1')
   assert.equal(resolveBaseUrl(''), '')
   assert.equal(resolveBaseUrl('   '), '')
+})
+
+test('normalizeRequestedSize maps 4K aliases to 3840x2160 and keeps real sizes', () => {
+  assert.equal(normalizeRequestedSize('3840x2160'), '3840x2160')
+  assert.equal(normalizeRequestedSize('3840×2160'), '3840x2160')
+  assert.equal(normalizeRequestedSize('4K'), '3840x2160')
+  assert.equal(normalizeRequestedSize('3840x3840'), '3840x3840')
+  assert.equal(normalizeRequestedSize('1024x1024'), '1024x1024')
+  assert.equal(normalizeRequestedSize(''), '')
 })
 
 test('resolveApiKey prefers a direct key, then an env-var name', () => {

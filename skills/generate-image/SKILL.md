@@ -49,9 +49,11 @@ or any other workaround — the `generate_image` tool is the intended path.
   must be multiples of 16 (for example, `768x1344`). If the user supplies an
   invalid custom size, ask them to choose a valid size or suggest a nearby valid
   size; do not call `generate_image` with the invalid value.
+  要 4K 请传 **`3840x2160`** 或 **`3840x3840`**：当前上游最大边为 3840px，
+  `4096` 会超出上限导致失败；`3840x2160` 不会被归一化。
 - `quality`（可选）: `auto` (default), `low`, `medium`, `high`, or any value the
   endpoint accepts.
-- `count`（可选）: 1–4 images (default 1).
+- `count`（可选）: 1–4 images (default 1)。上游接口当前要求 `n=1`，插件会自动拆成多次请求；客户端会把同一消息里的多张图**堆叠展示**。用户要求多张/多个版本时，直接设置 `count` 为所需数量（例如 `count=4`）。
 - `referenceImageIds`（图生图时必填）: an ordered array of one or more image
   attachment ids from the current conversation. Use the ids shown in image
   markers or previous `generate_image` results. Omit this field for
@@ -96,6 +98,15 @@ generate_image(
   referenceImageIds: ["sha256:first...", "sha256:second..."],
 )
 ```
+
+## 多图请求
+
+当用户要求生成多张图片、多个版本、多个角度/风格/姿势时（例如“生成 4 版形象图”）：
+
+1. 直接设置 `count` 为所需数量（如 `count=4`），一次调用生成多张。
+2. 插件会自动把 `count` 拆成多次 `n=1` 请求（因为上游当前只接受 `n=1`），并把所有图片放进同一条 assistant 消息。
+3. DSH 客户端已支持在同一消息里**堆叠展示**多张图，用户可以逐张查看/点击放大。
+4. 如果当前客户端版本较旧、仍只显示一张，可以退化为“一次对话只出一张”的流程：本轮生成第 1 张，告诉用户“这是第 1/N 张，回复‘下一张’继续”。
 
 ## 结果处理
 

@@ -1,3 +1,9 @@
 - insert:
     - id: generation-image
       name: '@dsh-extension/dsh-generation-image'
+
+# 允许 DSH 附件保存 4K（3840）原图，避免被压到 2048
+- id: attachment-local
+  config:
+    normalizedImageMaxDimension: 4096
+    normalizedImageMaxBytes: 26214400

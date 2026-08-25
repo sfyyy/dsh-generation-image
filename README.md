@@ -69,18 +69,18 @@ enter the agent.
 ## Viewing generated images
 
 The DSH Web UI renders every generated image as a **thumbnail** in the
-conversation (an assistant-side image message). Click it to open the enlarged
-lightbox:
+conversation (an assistant-side image message). Multiple images in one message
+are **stacked vertically**; click any image to open the enlarged preview:
 
-- **下载原图** — a download button injected by this plugin's client (top-right of
-  the enlarged view) saves the full-resolution image to disk. It applies to
-  every image lightbox in the session, so uploaded images and screenshots get
-  the same download affordance.
-- **关闭** — the built-in close control (and `Esc` / clicking the mask).
+- **下载原图** — the download button in the top-right of the enlarged preview
+  saves the current full-resolution image to disk.
+- **关闭** — the close button in the top-right (or clicking the mask).
+- **左右切换** — with multiple images, the preview shows `n / N` and provides
+  previous/next buttons on the sides.
 
-No extra configuration is needed; the thumbnail, enlarge, download and close
-behaviors are enabled as soon as the plugin's client bundle is loaded (refresh
-the DSH web page after upgrading the plugin).
+No extra configuration is needed; the stacked display and preview controls are
+enabled as soon as the plugin's client bundle is loaded (refresh the DSH web
+page after upgrading the plugin).
 
 ## Installation
 
@@ -165,10 +165,17 @@ environment variables → config file.
   - `prompt` (required): a detailed description of the image to generate;
   - `size` (optional, **unrestricted**): pass any size the endpoint accepts
     (e.g. `1024x1024`, `1024x1792`, `1792x1024`), or `"auto"`/omit to let the
-    API decide;
+    API decide. For true 4K use **`3840x2160`** or **`3840x3840`** — the current
+    upstream max edge is 3840px; `4096` exceeds the limit and fails. The
+    plugin's bundle patch also raises DSH attachment-local limits
+    (`normalizedImageMaxDimension: 4096`, `normalizedImageMaxBytes: 26214400`)
+    so saved 4K images are not compressed down to 2048;
   - `quality` (optional, **unrestricted**): common values are `auto` (default),
     `low`, `medium`, `high`, or any value your endpoint accepts;
-  - `count` (optional, 1–4): how many images to generate (default 1).
+  - `count` (optional, 1–4): how many images to generate (default 1). The
+    upstream endpoint currently requires `n=1`, so the plugin automatically
+    splits `count > 1` into multiple `n=1` requests. The DSH client renders
+    multiple images in one assistant message stacked vertically.
   - `referenceImageIds` (optional): ordered, unique image attachment ids from
     the current conversation. Omit for text-to-image; provide one or more for
     image-to-image editing or combining references. The deployment's DSH image
