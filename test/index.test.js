@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { Buffer } from 'node:buffer'
+import { readFileSync } from 'node:fs'
 import { assertSupportedJsonSchema, JsonSchemaError } from '@deepseek-ai/dsh-tools'
 import { createAssistantMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
 import { Session } from '@deepseek-ai/dsh-session'
@@ -1312,6 +1313,99 @@ test('mode: always keeps rewriting even for a multimodal route', async () => {
 
   const derived = session.deriveMessages()
   assert.equal(contentHasImage(derived[0].content), false, 'legacy mode rewrites regardless of capability')
+})
+
+// ── client half: settings-response handling ─────────────────────────────────
+// The client half is a browser bundle with no build step, so it is evaluated
+// here with stubbed globals. This pins the bug where opening the Settings page
+// before the host half registered its route surfaced V8's
+// "Unexpected end of JSON input" instead of a cause the user could act on.
+
+/** Evaluate lib/client.js against stub globals and return its exports. */
+function loadClientBundle() {
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+  let loaded = null
+  const stubReact = {
+    createElement: () => null,
+    useEffect: () => {},
+    useState: () => [null, () => {}],
+    useRef: () => ({ current: null }),
+  }
+  const stubRequire = (id) => {
+    if (id === 'react') return stubReact
+    if (id === '@deepseek-ai/dsh-client-ui-primitives') return { Button: () => null, Input: () => null }
+    throw new Error(`unexpected client require: ${id}`)
+  }
+  const window = {
+    __ModuleLoader__: {
+      load: ({ factory }) => { loaded = factory(stubRequire) },
+    },
+  }
+  new Function('window', 'document', source)(window, { createElement: () => ({}) })
+  assert.ok(loaded && loaded.__test, 'the client bundle must expose its test hook')
+  return loaded
+}
+
+/** A `fetch` Response stand-in with the fields `readJsonBody` reads. */
+function fakeResponse(status, body, contentType) {
+  return {
+    status,
+    headers: { get: (name) => (name.toLowerCase() === 'content-type' ? contentType : null) },
+    text: async () => body,
+  }
+}
+
+test('client: an unregistered settings route reports a cause, not a JSON parse error', async () => {
+  const { readJsonBody } = loadClientBundle().__test
+  // Exactly what the harness answers for a path no plugin has registered yet:
+  // 404 with a zero-byte body.
+  await assert.rejects(
+    readJsonBody(fakeResponse(404, '', null)),
+    (err) => {
+      assert.match(err.message, /404/)
+      assert.match(err.message, /尚未注册/)
+      assert.ok(!err.message.includes('Unexpected end of JSON input'), "V8's parse error must not leak")
+      assert.equal(err.transient, true, 'a 404 is retryable — the host half may still be activating')
+      return true
+    },
+  )
+  // A 200 with an empty body is the same class of failure.
+  await assert.rejects(
+    readJsonBody(fakeResponse(200, '   ', 'application/json')),
+    (err) => {
+      assert.match(err.message, /空响应/)
+      assert.equal(err.transient, true)
+      return true
+    },
+  )
+})
+
+test('client: the SPA HTML fallback is reported as a registration problem and is retryable', async () => {
+  const { readJsonBody } = loadClientBundle().__test
+  await assert.rejects(
+    readJsonBody(fakeResponse(200, '<!doctype html><div id="root"></div>', 'text/html; charset=utf-8')),
+    (err) => {
+      assert.match(err.message, /HTML/)
+      assert.equal(err.transient, true)
+      return true
+    },
+  )
+})
+
+test('client: a valid settings payload parses, and a malformed one is not retried', async () => {
+  const { readJsonBody, LOAD_RETRY_DELAYS_MS } = loadClientBundle().__test
+  const payload = { ok: true, value: { effective: { baseUrl: 'https://image.example/v1' } } }
+  assert.deepEqual(await readJsonBody(fakeResponse(200, JSON.stringify(payload), 'application/json')), payload)
+  // A truncated-but-non-empty body is a real fault: report it, do not retry forever.
+  await assert.rejects(
+    readJsonBody(fakeResponse(200, '{"ok":', 'application/json')),
+    (err) => {
+      assert.match(err.message, /无法解析的内容/)
+      assert.notEqual(err.transient, true)
+      return true
+    },
+  )
+  assert.ok(LOAD_RETRY_DELAYS_MS.length > 0, 'the first load must retry at least once')
 })
 
 // restore the config-path env so later tests (if any) are isolated
