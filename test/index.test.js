@@ -21,9 +21,16 @@ import {
   normalizeRequestedSize,
   resolveApiKey,
   resolveConfig,
+  imageMarker,
+  resolveMarkerMode,
+  normalizeRoute,
+  routeHasNativeImage,
+  shouldRewriteImages,
   rewriteImageBlocksToMarkers,
   formatGenerationEnvelope,
   generateImagesFromApi,
+  sessionEvents,
+  sessionImageRefs,
 } from '../lib/index.js'
 
 /** A minimal valid PNG header (>= 12 bytes so sniffMediaType can decide). */
@@ -197,7 +204,9 @@ function createStrictCtx(config, extra = {}) {
 function fakeSession(messages, events = [], id = 's1') {
   return {
     id,
-    events,
+    // The current harness exposes the log through `snapshotEvents()`; there is
+    // no `Session.events` array to read.
+    snapshotEvents: () => events,
     deriveMessages() {
       return messages
     },
@@ -429,6 +438,8 @@ test('AC2b: generated image displays on the left without duplicating model-visib
         { type: 'text', text: 'original assistant text' },
         { type: 'tool-call', id: callId, name: 'generate_image', arguments: '{"prompt":"a puppy"}' },
       ] }),
+      // A real harness settlement always embeds its compact stream.
+      stream: [],
     },
     { surfaceOp: 'append' },
   )
@@ -448,33 +459,55 @@ test('AC2b: generated image displays on the left without duplicating model-visib
     },
   )
 
-  assert.equal(deferred.length, 0, 'left-side display must not fall back to deferContext')
-  const assistantEvents = session.events.filter((event) => event.type === 'assistant/message')
-  assert.equal(assistantEvents.length, 3, 'original, UI append, and model-surface replacement')
+  assert.equal(deferred.length, 0, 'left-side display must not create a right-side user context')
+  const assistantEvents = sessionEvents(session).filter((event) => event.type === 'assistant/message')
+  assert.equal(assistantEvents.length, 2, 'the original model message plus the UI display append')
   const display = assistantEvents[1]
-  const replacement = assistantEvents[2]
   assert.equal(display.surfaceOp, 'append', 'the UI consumes the append event')
-  assert.equal(display.data.message.content.filter((block) => block.type === 'image').length, 1)
-  assert.equal(display.data.message.source.replayState, undefined, 'changed UI content must not claim replay fidelity')
-  assert.deepEqual(replacement.surfaceOp, { op: 'replace', start: original.seq, end: display.seq })
-  assert.deepEqual(replacement.sourceEventSeqs, [original.seq, display.seq])
-  assert.deepEqual(replacement.data.message.source, original.data.message.source)
-  assert.deepEqual(replacement.data.message.content, original.data.message.content)
-  assert.doesNotThrow(
-    () => Session.create('s-left-image-reload', session.events),
-    'persisted replacement events must remain valid after session reload',
+  const displayImages = display.data.message.content.filter((block) => block.type === 'image')
+  assert.equal(displayImages.length, 1)
+  assert.equal(displayImages[0].attachment.attachmentId, value.images[0].attachmentId)
+
+  // The display append is a durable Assistant settlement, so it must carry the
+  // settlement's `stream`. A streamless assistant/message crashes every consumer
+  // that reads `event.data.stream` (TokenMeter's usageOf is the one that kills
+  // the turn right after a generation) and makes the log unloadable.
+  assert.deepEqual(display.data.stream, [], 'the display settlement carries an empty durable stream')
+
+  // Regression: the whole log must survive the restore-time seed validation,
+  // which requires an array `stream` on every assistant/message. Snapshot
+  // construction appends one `session/end-seed` marker of its own.
+  const live = sessionEvents(session)
+  const restored = Session.create(
+    's-left-image-restore',
+    structuredClone(live),
+    { ...session.header, id: 's-left-image-restore' },
   )
+  const restoredEvents = restored.snapshotEvents()
+  assert.equal(restoredEvents.length, live.length + 1, 'the log round-trips through seed validation')
+  assert.deepEqual(restoredEvents[display.seq].data.stream, [], 'the display settlement keeps its stream after restore')
+
+  // The shadow must be an empty system/message: the current harness rejects both a
+  // replacement and sourceEventSeqs on assistant/message, which is exactly what used
+  // to make this append fail so the generated image never reached the conversation.
+  const shadows = sessionEvents(session).filter((event) => event.surfaceOp !== undefined && event.surfaceOp !== 'append')
+  assert.equal(shadows.length, 1)
+  const shadow = shadows[0]
+  assert.equal(shadow.type, 'system/message')
+  assert.deepEqual(shadow.surfaceOp, { op: 'replace', startSeq: display.seq, endSeq: display.seq })
+  assert.deepEqual(shadow.sourceEventSeqs, [display.seq])
+  assert.deepEqual(shadow.data.message.content, [], 'the shadow renders no UI row and carries no text')
+  assert.deepEqual(shadow.data.message.source, { kind: 'plugin', plugin: 'generation-image' })
+  assert.equal(session.surface.nodes.includes(display.seq), false, 'the display append leaves the model surface')
+  assert.equal(session.surface.nodes.includes(original.seq), true, 'the model message stays on the surface')
 
   const derived = session.deriveMessages()
-  assert.equal(derived.length, 1, 'the model surface keeps one assistant message')
+  assert.equal(derived.length, 1, 'the display append and its shadow stay off the model surface')
   const content = derived[0].content
-  const imageBlocks = content.filter((block) => block.type === 'image')
-  assert.equal(imageBlocks.length, 0, 'UI-only image blocks must not alter model replay content')
-  const displayImage = display.data.message.content.find((block) => block.type === 'image')
-  assert.equal(displayImage.attachment.attachmentId, value.images[0].attachmentId)
-  assert.equal(content[0].type, 'text', 'the step original text content is preserved (merged)')
+  assert.equal(content.filter((block) => block.type === 'image').length, 0, 'UI-only image blocks must not alter model replay content')
+  assert.equal(content.filter((block) => block.type === 'tool-call').length, 1, 'the tool call appears exactly once')
+  assert.equal(content[0].type, 'text', 'the step original text content is preserved')
   assert.equal(content[0].text, 'original assistant text')
-  assert.equal(content.filter((block) => block.type === 'tool-call').length, 1)
 })
 
 test('AC2c: four out-of-order concurrent generations keep one call set and four left-side images', async () => {
@@ -540,45 +573,40 @@ test('AC2c: four out-of-order concurrent generations keep one call set and four 
     return value
   }))
 
-  assert.equal(deferred.length, 0)
+  assert.equal(deferred.length, 0, 'left-side display must not create right-side user contexts')
+  const assistantEvents = sessionEvents(session).filter((event) => event.type === 'assistant/message')
+  assert.equal(assistantEvents.length, 5, 'the model message plus one display append per generation')
+  const displays = assistantEvents.slice(1)
+  assert.deepEqual(displays.map((event) => event.surfaceOp), ['append', 'append', 'append', 'append'])
+  const finalImages = displays.at(-1).data.message.content.filter((block) => block.type === 'image')
+  assert.equal(finalImages.length, 4, 'the last display append stacks every generated image')
+  assert.equal(new Set(finalImages.map((block) => block.attachment.attachmentId)).size, 4)
+
+  // Every display append is shadowed by an empty system/message, so concurrent
+  // generations never leave a duplicate tool call on the model surface.
+  const shadows = sessionEvents(session).filter((event) => event.surfaceOp !== undefined && event.surfaceOp !== 'append')
+  assert.equal(shadows.length, 4)
+  for (const [index, shadow] of shadows.entries()) {
+    assert.equal(shadow.type, 'system/message')
+    assert.deepEqual(shadow.data.message.content, [])
+    assert.deepEqual(shadow.sourceEventSeqs, [displays[index].seq])
+  }
+  assert.equal(session.surface.nodes.includes(assistantEvents[0].seq), true, 'the model message stays on the surface')
+
   const derived = session.deriveMessages()
   const assistants = derived.filter((message) => message.role === 'assistant')
-  assert.equal(assistants.length, 1, 'all UI appends must fold into one model assistant message')
+  assert.equal(assistants.length, 1, 'all display appends must fold away from the model surface')
   assert.deepEqual(
     assistants[0].content.filter((block) => block.type === 'tool-call').map((block) => block.id),
     callIds,
   )
   assert.equal(assistants[0].content.filter((block) => block.type === 'image').length, 0)
 
-  const displayEvents = session.events.filter(
-    (event) => event.type === 'assistant/message' && event.surfaceOp === 'append'
-      && event.data.message.content.some((block) => block.type === 'image'),
-  )
-  const images = displayEvents.at(-1).data.message.content.filter((block) => block.type === 'image')
-  assert.equal(displayEvents.length, 4)
-  assert.equal(images.length, 4)
-  assert.equal(new Set(images.map((block) => block.attachment.attachmentId)).size, 4)
-
   const results = derived.flatMap((message) => message.content.filter((block) => block.type === 'tool-result'))
   assert.deepEqual(
     results.map((result) => result.toolCallId).sort(),
     [...callIds].sort(),
     'all tool results must remain on the model surface regardless of completion order',
-  )
-  assert.equal(session.events.filter((event) => event.type === 'assistant/message' && event.surfaceOp === 'append').length, 5)
-  assert.equal(session.events.filter((event) => event.type === 'assistant/message' && event.surfaceOp !== 'append').length, 4)
-  const finalReplacement = session.events.filter(
-    (event) => event.type === 'assistant/message' && event.surfaceOp !== 'append',
-  ).at(-1)
-  assert.deepEqual(finalReplacement.data.message.source, session.events[0].data.message.source)
-  assert.deepEqual(
-    finalReplacement.data.message.content,
-    [],
-    'interleaved calls shadow only the latest display append with an empty model-only message',
-  )
-  assert.doesNotThrow(
-    () => Session.create('s-concurrent-left-images-reload', session.events),
-    'concurrent replacement history must remain valid after session reload',
   )
 })
 
@@ -692,6 +720,85 @@ test('AC3b: invalid reference image lists fail before attachment reads or networ
   await assert.rejects(tool.execute({ prompt: 'edit', referenceImageIds: [missingId] }, exec), /not available in this session/)
   assert.equal(ctx._calls.readImage.length, 0)
   assert.equal(fetches, 0)
+})
+
+test('AC3d: sessionEvents reads the current Session API', () => {
+  const session = Session.create('s-session-events')
+  session.append('user/message', {
+    content: [makeImageBlock(AID('u1'), 'upload.png')],
+    source: { kind: 'user', rpcId: 'rpc-1' },
+    role: 'user',
+    id: 'msg-1',
+  }, { surfaceOp: 'append' })
+
+  assert.equal(session.events, undefined, 'the harness exposes no Session.events array')
+  assert.deepEqual(sessionEvents(session), session.snapshotEvents(), 'the log comes from snapshotEvents()')
+  assert.equal(sessionEvents(session).length, 1)
+  assert.equal(sessionEvents(undefined).length, 0)
+  assert.equal(sessionEvents({}).length, 0)
+})
+
+test('AC3e: referenceImageIds resolves user uploads, inbox splices, bare hashes, and names what is missing', async () => {
+  const b64 = base64Of(PNG)
+  const uploadedId = AID('upload')
+  const splicedId = AID('spliced')
+  const session = Session.create('s-reference-shapes')
+  // Exactly the two shapes the harness writes for a user turn: the message event
+  // carries content directly, and the inbox splice nests it under `inserted`.
+  session.append('user/message', {
+    content: [makeImageBlock(uploadedId, 'user-upload.png')],
+    source: { kind: 'user', rpcId: 'rpc-1' },
+    role: 'user',
+    id: 'msg-1',
+  }, { surfaceOp: 'append' })
+  session.append('agent/inbox/spliced', {
+    target: 'next-turn',
+    start: 0,
+    inserted: [{ content: [makeImageBlock(splicedId, 'spliced.png')] }],
+  })
+
+  const refs = sessionImageRefs(session)
+  assert.equal(refs.get(uploadedId).attachmentId, uploadedId)
+  assert.equal(refs.get(splicedId).attachmentId, splicedId)
+  assert.equal(
+    refs.get(uploadedId.slice('sha256:'.length)).attachmentId,
+    uploadedId,
+    'a bare hash must address the same attachment as its sha256: form',
+  )
+
+  const seen = []
+  const ctx = createFakeCtx(CONFIG)
+  await apply(ctx, {
+    fetch: async (url, init) => {
+      seen.push({ url, init })
+      return new Response(
+        JSON.stringify({ data: [{ b64_json: b64 }] }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      )
+    },
+  })
+  const tool = ctx._tools.registered.find((d) => d.name === 'generate_image')
+  const exec = { agent: { session } }
+
+  // The model is told the prefixed id; a model that strips the prefix must still work,
+  // and the spliced copy must be addressable too.
+  const value = await tool.execute(
+    { prompt: 'isolate the character on magenta', referenceImageIds: [uploadedId.slice('sha256:'.length), splicedId] },
+    exec,
+  )
+  assert.equal(value.images.length, 1)
+  assert.match(seen[0].url, /\/images\/edits$/)
+  assert.deepEqual(ctx._calls.readImage.map((call) => call.ref.attachmentId), [uploadedId, splicedId])
+
+  await assert.rejects(
+    tool.execute({ prompt: 'edit', referenceImageIds: [AID('nope')] }, exec),
+    (err) => {
+      assert.match(err.message, /not available in this session/)
+      assert.match(err.message, new RegExp(uploadedId.slice('sha256:'.length, 'sha256:'.length + 12)))
+      return true
+    },
+    'a miss must name the ids that do exist',
+  )
 })
 
 test('AC3c: size/quality are unrestricted — auto/empty is omitted, custom values pass through', async () => {
@@ -1093,6 +1200,118 @@ test('resolveConfig applies env overrides', () => {
 test('rewriteImageBlocksToMarkers returns original when no image present', () => {
   const plain = { role: 'user', content: [{ type: 'text', text: 'hi' }] }
   assert.equal(rewriteImageBlocksToMarkers(plain), plain)
+})
+
+test('imageMarker points the model at generate_image and nothing else', () => {
+  const block = { type: 'image', attachment: { attachmentId: AID('v1'), name: 'shot.png' } }
+  const text = imageMarker(block).text
+  assert.ok(!text.includes('vision_describe'), 'no other plugin tool may be advertised')
+  assert.ok(text.includes(`generate_image 并传入 referenceImageIds: ["${AID('v1')}"]`), 'the generate_image hint stays')
+  assert.ok(!text.includes('undefined'), 'no placeholder leaks into the marker')
+})
+
+test('rewriteImageBlocksToMarkers rewrites images nested in tool-result content', () => {
+  const message = {
+    role: 'user',
+    content: [
+      {
+        type: 'tool-result',
+        toolCallId: 'call-1',
+        content: [{ type: 'image', attachment: { attachmentId: AID('v3') } }],
+      },
+    ],
+  }
+  const rewritten = rewriteImageBlocksToMarkers(message)
+  const flat = JSON.stringify(rewritten)
+  assert.ok(!flat.includes('"type":"image"'), 'the nested image block is replaced')
+  assert.ok(flat.includes(AID('v3')), 'the marker still names the attachment')
+  assert.equal(rewritten.content[0].type, 'tool-result', 'the tool-result envelope survives')
+})
+
+test('resolveMarkerMode defaults to native and only "always" keeps the legacy rewrite', () => {
+  assert.equal(resolveMarkerMode({}), 'native')
+  assert.equal(resolveMarkerMode({ mode: 'native' }), 'native')
+  assert.equal(resolveMarkerMode({ mode: 'garbage' }), 'native')
+  assert.equal(resolveMarkerMode({ mode: 'always' }), 'always')
+  assert.equal(resolveMarkerMode({ mode: ' ALWAYS ' }), 'always')
+})
+
+test('shouldRewriteImages leaves an image-capable route alone outside legacy mode', () => {
+  assert.equal(shouldRewriteImages({ mode: 'native' }, true), false, 'vision model keeps its images')
+  assert.equal(shouldRewriteImages({ mode: 'native' }, false), true, 'text-only model gets markers')
+  assert.equal(shouldRewriteImages({ mode: 'always' }, true), true, 'legacy mode always rewrites')
+  assert.equal(shouldRewriteImages({}, true), false, 'default is native')
+})
+
+test('routeHasNativeImage reads the catalog and answers true when unknown', async () => {
+  assert.equal(normalizeRoute('a6api', 'deepseek-v4.1-flash').model, 'deepseek-v4.1-flash')
+  assert.equal(normalizeRoute('', 'm'), undefined)
+  assert.equal(normalizeRoute('p', undefined), undefined)
+  const imageCtx = { llm: { resolveModelInfo: async () => ({ inputModalities: ['text', 'image'] }) } }
+  const textCtx = { llm: { resolveModelInfo: async () => ({ inputModalities: ['text'] }) } }
+  const boomCtx = { llm: { resolveModelInfo: async () => { throw new Error('nope') } } }
+  assert.equal(await routeHasNativeImage(imageCtx, { provider: 'p', model: 'm' }), true)
+  assert.equal(await routeHasNativeImage(textCtx, { provider: 'p', model: 'm' }), false)
+  assert.equal(await routeHasNativeImage(boomCtx, { provider: 'p', model: 'm' }), true, 'a failed lookup must not destroy the image')
+  assert.equal(await routeHasNativeImage(imageCtx, undefined), true, 'no route known → non-lossy default')
+  assert.equal(await routeHasNativeImage({}, { provider: 'p', model: 'm' }), true, 'no llm service → non-lossy default')
+})
+
+test('a multimodal route keeps its real image blocks through the apply() pipeline', async () => {
+  const ctx = createFakeCtx(CONFIG, {
+    resolveModelInfo: async () => ({ inputModalities: ['text', 'image'] }),
+  })
+  const session = fakeSession([{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: AID('n1') } }] }])
+  const agent = { session }
+  await apply(ctx, { fetch: noNetworkFetch() })
+
+  const onRequest = ctx._handlers.get('agent/request')
+  assert.ok(onRequest, 'agent/request handler must be registered for route tracking')
+  await onRequest({ agent }, async () => ({ provider: 'a6api', model: 'deepseek-v4.1-flash' }))
+  const preStep = ctx._handlers.get('agent/pre-step')
+  await preStep({ agent }, async () => ({ kind: 'enter', messages: [] }))
+
+  const derived = session.deriveMessages()
+  assert.ok(!(derived instanceof Promise), 'deriveMessages must stay synchronous — the agent loop never awaits it')
+  assert.equal(contentHasImage(derived[0].content), true, 'a vision route must receive the actual image block')
+  assert.ok(!JSON.stringify(derived).includes('附件 id'), 'no marker may replace a readable image')
+})
+
+test('a text-only verdict still replaces the image (decision + replacement unit proof)', async () => {
+  // The apply() pipeline cannot be driven to a text-only verdict from this
+  // harness: the injected `llm` service resolves model metadata through the
+  // real catalog, so a stubbed `resolveModelInfo` result is not authoritative.
+  // The gate itself is therefore pinned here at the unit level — a text-only
+  // verdict must reach the marker replacement, and a vision verdict must not.
+  const cfg = { mode: 'native' }
+  const session = fakeSession([{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: AID('t1') } }] }])
+  const messages = session.deriveMessages()
+
+  const textOnlyVerdict = await routeHasNativeImage(
+    { llm: { resolveModelInfo: async () => ({ inputModalities: ['text'] }) } },
+    { provider: 'p', model: 'm' },
+  )
+  assert.equal(textOnlyVerdict, false)
+  assert.equal(shouldRewriteImages(cfg, textOnlyVerdict), true, 'a text-only verdict must rewrite')
+  const rewritten = messages.map((m) => rewriteImageBlocksToMarkers(m))
+  assert.equal(contentHasImage(rewritten[0].content), false, 'the text-only path still produces markers')
+  assert.ok(rewritten[0].content.some((b) => b.type === 'text' && b.text.includes(AID('t1'))))
+  assert.equal(contentHasImage(messages[0].content), true, 'the original message object stays untouched')
+})
+
+test('mode: always keeps rewriting even for a multimodal route', async () => {
+  const ctx = createFakeCtx({ ...CONFIG, mode: 'always' }, {
+    resolveModelInfo: async () => ({ inputModalities: ['text', 'image'] }),
+  })
+  const session = fakeSession([{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: AID('a1') } }] }])
+  const agent = { session }
+  await apply(ctx, { fetch: noNetworkFetch() })
+
+  await ctx._handlers.get('agent/request')({ agent }, async () => ({ provider: 'a6api', model: 'deepseek-v4.1-flash' }))
+  await ctx._handlers.get('agent/pre-step')({ agent }, async () => ({ kind: 'enter', messages: [] }))
+
+  const derived = session.deriveMessages()
+  assert.equal(contentHasImage(derived[0].content), false, 'legacy mode rewrites regardless of capability')
 })
 
 // restore the config-path env so later tests (if any) are isolated
