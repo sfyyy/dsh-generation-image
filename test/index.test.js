@@ -1326,7 +1326,7 @@ function loadClientBundle() {
   const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
   let loaded = null
   const stubReact = {
-    createElement: () => null,
+    createElement: (type, props, ...children) => ({ type, props: props || {}, children }),
     useEffect: () => {},
     useState: () => [null, () => {}],
     useRef: () => ({ current: null }),
@@ -1406,6 +1406,36 @@ test('client: a valid settings payload parses, and a malformed one is not retrie
     },
   )
   assert.ok(LOAD_RETRY_DELAYS_MS.length > 0, 'the first load must retry at least once')
+})
+
+test('client: the preview prev/next arrows are vertically centred by construction', () => {
+  const { previewChevron, stackedPreviewNavStyle } = loadClientBundle().__test
+
+  for (const direction of ['prev', 'next']) {
+    const svg = previewChevron(direction)
+    assert.equal(svg.type, 'svg', 'the arrow is a vector, not a font glyph')
+    assert.equal(svg.props.viewBox, '0 0 24 24', 'the stroke is authored in a square viewBox')
+    assert.equal(svg.props.style.display, 'block', 'block display removes the inline baseline gap')
+
+    const polyline = svg.children[0]
+    assert.equal(polyline.type, 'polyline')
+    const numbers = String(polyline.props.points).trim().split(/[\s,]+/).map(Number)
+    assert.equal(numbers.length, 6, 'three points, as x y pairs')
+    const xs = numbers.filter((_, i) => i % 2 === 0)
+    const ys = numbers.filter((_, i) => i % 2 === 1)
+
+    // The property that makes the arrow look centred inside the round button:
+    // its ink is symmetric about the viewBox's vertical middle.
+    assert.equal(Math.min(...ys) + Math.max(...ys), 24, `${direction}: symmetric about the middle`)
+    assert.ok(ys.includes(12), `${direction}: the tip sits exactly on the vertical middle`)
+    assert.ok(Math.min(...xs) >= 0 && Math.max(...xs) <= 24, `${direction}: the stroke stays in the viewBox`)
+    assert.ok(Math.min(...xs) < 12 && Math.max(...xs) > 12, `${direction}: the arrow spans the middle horizontally`)
+  }
+
+  // Regression: centring the glyph with font metrics is what put the ink below
+  // the middle. A glyph-sized line box must not come back.
+  assert.equal(stackedPreviewNavStyle.fontSize, undefined, 'no glyph size to centre')
+  assert.equal(stackedPreviewNavStyle.lineHeight, undefined, 'no glyph line box to centre')
 })
 
 // restore the config-path env so later tests (if any) are isolated
